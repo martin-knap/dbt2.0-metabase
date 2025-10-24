@@ -176,6 +176,10 @@ class Manifest:
     ) -> Mapping[str, Mapping[str, str]]:
         relationships = {}
 
+        # Check if model has any children (tests) in child_map
+        if unique_id not in manifest["child_map"]:
+            return relationships
+
         for child_id in manifest["child_map"][unique_id]:
             child = manifest.get(group, {}).get(child_id, {})
             child_name = child.get("alias", child.get("name"))
@@ -260,9 +264,48 @@ class Manifest:
 
                 fk_target_schema = fk_target_model.get("schema", DEFAULT_SCHEMA)
                 fk_target_table = f"{fk_target_schema}.{fk_target_table}"
-                fk_target_field = child["test_metadata"]["kwargs"]["field"].strip('"')
 
-                relationships[child["column_name"]] = {
+                # Support both dbt 1.x and dbt 2.0 manifest formats
+                test_kwargs = child["test_metadata"]["kwargs"]
+                fk_target_field = None
+
+                # Try dbt 2.0 format: kwargs.arguments.field
+                if "arguments" in test_kwargs and "field" in test_kwargs["arguments"]:
+                    fk_target_field = test_kwargs["arguments"]["field"].strip('"')
+                # Try dbt 1.x format: kwargs.field
+                elif "field" in test_kwargs:
+                    fk_target_field = test_kwargs["field"].strip('"')
+                # dbt 2.0 alternative: parse from compiled_code
+                elif "compiled_code" in child:
+                    # Extract field from compiled SQL: "select <field> as to_field"
+                    import re
+                    match = re.search(r"select\s+(\w+)\s+as\s+to_field", child["compiled_code"], re.IGNORECASE)
+                    if match:
+                        fk_target_field = match.group(1)
+                    else:
+                        _logger.warning(
+                            "Cannot extract target field for relationship '%s'",
+                            child_name,
+                        )
+                        continue
+
+                if not fk_target_field:
+                    _logger.warning(
+                        "Missing target field for relationship '%s'",
+                        child_name,
+                    )
+                    continue
+
+                # Get source column name from kwargs (both dbt 1.x and 2.0)
+                source_column = test_kwargs.get("column_name")
+                if not source_column:
+                    _logger.warning(
+                        "Missing source column for relationship '%s'",
+                        child_name,
+                    )
+                    continue
+
+                relationships[source_column] = {
                     "fk_target_table": fk_target_table,
                     "fk_target_field": fk_target_field,
                 }
