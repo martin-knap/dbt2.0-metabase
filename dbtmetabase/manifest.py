@@ -159,6 +159,12 @@ class Manifest:
             **meta,
         )
 
+        # DEBUG: Log constraints
+        col_name = manifest_column.get("name", "")
+        constraints = manifest_column.get("constraints", [])
+        if constraints:
+            _logger.debug(f"Column {col_name} has constraints: {constraints}")
+
         self._set_column_relationship(
             manifest_column=manifest_column,
             column=column,
@@ -181,7 +187,7 @@ class Manifest:
             return relationships
 
         for child_id in manifest["child_map"][unique_id]:
-            child = manifest.get(group, {}).get(child_id, {})
+            child = manifest.get("nodes", {}).get(child_id, {})
             child_name = child.get("alias", child.get("name"))
 
             if (
@@ -216,6 +222,10 @@ class Manifest:
                     )
                     continue
 
+                # dbt 2.0: depends_on_nodes contains [source_model, target_model]
+                # We want to process relationships where source_model is the current model
+                # and skip incoming relationships where target_model is the current model
+
                 if len(depends_on_nodes) > 2:
                     _logger.warning(
                         "Unexpected %d depends_on for relationship '%s' instead of <=2, skipping",
@@ -224,29 +234,37 @@ class Manifest:
                     )
                     continue
 
-                # Skip the incoming relationship tests, in which the fk_target_table is the model currently being read.
-                # Otherwise, the primary key of the current model would be (incorrectly) determined to be FK.
-                if len(depends_on_nodes) == 2 and depends_on_nodes[1] != unique_id:
+                if len(depends_on_nodes) != 2:
+                    _logger.warning(
+                        "Expected 2 dependencies for relationship '%s', got %d, skipping",
+                        child_name,
+                        len(depends_on_nodes),
+                    )
+                    continue
+
+                # Identify source (model with FK column) and target (model with PK)
+                # The test is defined on the source model, so first node should be source
+                source_model_id = depends_on_nodes[0]
+                target_model_id = depends_on_nodes[1]
+
+                # Skip if this is an incoming relationship (we're the target, not the source)
+                if target_model_id == unique_id:
                     _logger.debug(
-                        "Circular dependency '%s' for relationship '%s', skipping",
-                        depends_on_nodes[1],
+                        "Skipping incoming relationship test '%s' - we are the FK target, not source",
                         child_name,
                     )
                     continue
 
-                # Remove the current model from the list, ensuring it works for self-referencing models.
-                if len(depends_on_nodes) == 2 and unique_id in depends_on_nodes:
-                    depends_on_nodes.remove(unique_id)
-
-                if len(depends_on_nodes) != 1:
-                    _logger.warning(
-                        "Got %d dependencies for '%s' instead of 1, skipping",
-                        len(depends_on_nodes),
-                        unique_id,
+                # Process only if we are the source model
+                if source_model_id != unique_id:
+                    _logger.debug(
+                        "Skipping relationship test '%s' - not defined on current model",
+                        child_name,
                     )
                     continue
 
-                depends_on_id = depends_on_nodes[0]
+                # Now target_model_id is the FK target
+                depends_on_id = target_model_id
                 depends_on_group = Group.from_unique_id(depends_on_id)
                 if not depends_on_group:
                     _logger.debug("Unknown group dependency '%s'", depends_on_id)
@@ -265,33 +283,48 @@ class Manifest:
                 fk_target_schema = fk_target_model.get("schema", DEFAULT_SCHEMA)
                 fk_target_table = f"{fk_target_schema}.{fk_target_table}"
 
-                # Support both dbt 1.x and dbt 2.0 manifest formats
+                # dbt 2.0: Parse generated_sql_file to extract field parameter
                 test_kwargs = child["test_metadata"]["kwargs"]
                 fk_target_field = None
 
-                # Try dbt 2.0 format: kwargs.arguments.field
-                if "arguments" in test_kwargs and "field" in test_kwargs["arguments"]:
-                    fk_target_field = test_kwargs["arguments"]["field"].strip('"')
-                # Try dbt 1.x format: kwargs.field
-                elif "field" in test_kwargs:
-                    fk_target_field = test_kwargs["field"].strip('"')
-                # dbt 2.0 alternative: parse from compiled_code
-                elif "compiled_code" in child:
-                    # Extract field from compiled SQL: "select <field> as to_field"
-                    import re
-                    match = re.search(r"select\s+(\w+)\s+as\s+to_field", child["compiled_code"], re.IGNORECASE)
-                    if match:
-                        fk_target_field = match.group(1)
-                    else:
+                if "generated_sql_file" in child:
+                    # dbt 2.0 stores the rendered test call in generated_sql_file
+                    # Example: {{ test_relationships(column_name="product_id", field="product_id", model=..., to=ref('dim_product')) }}
+                    # The path is relative to project root, but manifest is in target/
+                    # So we need to go up one level from manifest location
+                    sql_file_path = child["generated_sql_file"]
+                    manifest_path = Path(self.path)
+                    # manifest is at dbt/target/manifest.json
+                    # sql_file_path is target/generic_tests/...sql
+                    # We need dbt/target/generic_tests/...sql
+                    project_root = manifest_path.parent.parent  # Go from target/ to dbt/
+                    sql_full_path = project_root / sql_file_path
+
+                    try:
+                        with open(sql_full_path, "r", encoding="utf-8") as f:
+                            sql_content = f.read()
+
+                        # Extract field= parameter from the test call
+                        import re
+                        field_match = re.search(r'field=["\']?(\w+)["\']?', sql_content)
+                        if field_match:
+                            fk_target_field = field_match.group(1)
+                        else:
+                            _logger.warning(
+                                "Cannot extract target field from generated SQL for relationship '%s'",
+                                child_name,
+                            )
+                            continue
+                    except Exception as e:
                         _logger.warning(
-                            "Cannot extract target field for relationship '%s'",
+                            "Failed to read generated SQL file for relationship '%s': %s",
                             child_name,
+                            e,
                         )
                         continue
-
-                if not fk_target_field:
+                else:
                     _logger.warning(
-                        "Missing target field for relationship '%s'",
+                        "Missing generated_sql_file for relationship '%s'",
                         child_name,
                     )
                     continue
