@@ -4,18 +4,10 @@ import dataclasses as dc
 import json
 import logging
 import re
+from collections.abc import Iterable, Mapping, MutableMapping, MutableSequence, Sequence
 from enum import Enum
 from pathlib import Path
-from typing import (
-    Any,
-    Iterable,
-    Mapping,
-    MutableMapping,
-    MutableSequence,
-    Optional,
-    Sequence,
-    Union,
-)
+from typing import Any
 
 from .format import NullValue
 
@@ -50,14 +42,12 @@ DEFAULT_SCHEMA = "PUBLIC"
 
 # Foreign key constraint: "schema.model (column)" / "model (column)"
 _CONSTRAINT_FK_PARSER = re.compile(r"(?P<model>.+)\s+\((?P<column>.+)\)")
-# Ref parser: "ref('model')"
-_REF_PARSER = re.compile(r"ref\('(?P<model>.+)'\)")
 
 
 class Manifest:
     """dbt manifest reader."""
 
-    def __init__(self, path: Union[str, Path]):
+    def __init__(self, path: str | Path):
         """Reader for compiled dbt manifest.json file.
 
         Args:
@@ -104,7 +94,7 @@ class Manifest:
         manifest: Mapping,
         manifest_model: Mapping,
         group: Group,
-        source: Optional[str] = None,
+        source: str | None = None,
     ) -> Model:
         database = manifest_model["database"]
         schema = manifest_model["schema"]
@@ -144,7 +134,7 @@ class Manifest:
         self,
         manifest_column: Mapping,
         schema: str,
-        relationship: Optional[Mapping],
+        relationship: Mapping | None,
     ) -> Column:
         meta = self._scan_fields(
             manifest_column.get("meta", {}),
@@ -350,7 +340,7 @@ class Manifest:
         manifest_column: Mapping,
         column: Column,
         schema: str,
-        relationship: Optional[Mapping],
+        relationship: Mapping | None,
     ):
         """Sets primary key and foreign key target on a column from constraints, meta fields or provided test relationship."""
 
@@ -383,11 +373,13 @@ class Manifest:
                         )
 
                 # Constraint: to + to_columns
+                # Foreign key constraint `to` compiles down to "project"."schema"."model"
                 elif constraint_to := constraint.get("to"):
-                    constraint_fk = _REF_PARSER.search(constraint_to)
+                    constraint_to_path = constraint_to.split(".")
                     constraint_to_columns = constraint.get("to_columns", [])
-                    if constraint_fk and len(constraint_to_columns) == 1:
-                        fk_target_table = constraint_fk.group("model")
+                    if len(constraint_to_path) <= 3 and len(constraint_to_columns) == 1:
+                        # "project"."schema"."model" -> "schema"."model"
+                        fk_target_table = ".".join(constraint_to_path[-2:])
                         fk_target_field = constraint_to_columns[0]
                     else:
                         _logger.warning(
@@ -452,7 +444,7 @@ class Group(str, Enum):
     sources = "sources"
 
     @staticmethod
-    def from_unique_id(unique_id: str) -> Optional[Group]:
+    def from_unique_id(unique_id: str) -> Group | None:
         prefix = unique_id.split(".")[0]
         if prefix == "source":
             return Group.sources
@@ -464,18 +456,18 @@ class Group(str, Enum):
 @dc.dataclass
 class Column:
     name: str
-    description: Optional[str] = None
-    display_name: Optional[str] = None
-    visibility_type: Optional[str] = None
-    semantic_type: Optional[str] = None
-    has_field_values: Optional[str] = None
-    coercion_strategy: Optional[str] = None
-    number_style: Optional[str] = None
-    decimals: Optional[int] = None
-    currency: Optional[str] = None
+    description: str | None = None
+    display_name: str | None = None
+    visibility_type: str | None = None
+    semantic_type: str | None = None
+    has_field_values: str | None = None
+    coercion_strategy: str | None = None
+    number_style: str | None = None
+    decimals: int | None = None
+    currency: str | None = None
 
-    fk_target_table: Optional[str] = None
-    fk_target_field: Optional[str] = None
+    fk_target_table: str | None = None
+    fk_target_field: str | None = None
 
     meta_fields: MutableMapping = dc.field(default_factory=dict)
 
@@ -488,20 +480,20 @@ class Model:
 
     name: str
     alias: str
-    description: Optional[str] = None
-    display_name: Optional[str] = None
-    visibility_type: Optional[str] = None
-    points_of_interest: Optional[str] = None
-    caveats: Optional[str] = None
+    description: str | None = None
+    display_name: str | None = None
+    visibility_type: str | None = None
+    points_of_interest: str | None = None
+    caveats: str | None = None
 
-    unique_id: Optional[str] = None
-    source: Optional[str] = None
-    tags: Optional[Sequence[str]] = dc.field(default_factory=list)
+    unique_id: str | None = None
+    source: str | None = None
+    tags: Sequence[str] | None = dc.field(default_factory=list)
 
     columns: Sequence[Column] = dc.field(default_factory=list)
 
     @property
-    def ref(self) -> Optional[str]:
+    def ref(self) -> str | None:
         if self.group == Group.nodes:
             return f"ref('{self.name}')"
         elif self.group == Group.sources:
@@ -521,7 +513,7 @@ class Model:
     def format_description(
         self,
         append_tags: bool = False,
-        docs_url: Optional[str] = None,
+        docs_url: str | None = None,
     ) -> str:
         """Formats description from available information.
 
