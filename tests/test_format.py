@@ -56,6 +56,7 @@ def test_safe_description():
 def test_dump_yaml():
     fixture_path = FIXTURES_PATH / "test_dump_yaml.yml"
     output_path = TMP_PATH / "test_dump_yaml.yml"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         dump_yaml(
             data={

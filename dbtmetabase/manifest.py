@@ -189,7 +189,11 @@ class Manifest:
                 # Using child[depends_on][nodes] and excluding the current model is better.
 
                 # Nodes contain at most two tables: referenced model and current model (optional).
-                depends_on_nodes = list(child["depends_on"][group])
+                depends_on = child.get("depends_on", {})
+                # dbt 2.0 uses "nodes" for both models and sources
+                depends_on_nodes = list(
+                    depends_on.get("nodes") or depends_on.get(group.value, [])
+                )
 
                 # Relationships on disabled models mention them in refs but not depends_on,
                 # which confuses the filtering logic that follows.
@@ -212,10 +216,6 @@ class Manifest:
                     )
                     continue
 
-                # dbt 2.0: depends_on_nodes contains [source_model, target_model]
-                # We want to process relationships where source_model is the current model
-                # and skip incoming relationships where target_model is the current model
-
                 if len(depends_on_nodes) > 2:
                     _logger.warning(
                         "Unexpected %d depends_on for relationship '%s' instead of <=2, skipping",
@@ -233,27 +233,69 @@ class Manifest:
                     continue
 
                 # Identify source (model with FK column) and target (model with PK)
-                # The test is defined on the source model, so first node should be source
-                source_model_id = depends_on_nodes[0]
-                target_model_id = depends_on_nodes[1]
+                test_kwargs = child.get("test_metadata", {}).get("kwargs", {})
+                model_expr = test_kwargs.get("model", "")
+                to_expr = test_kwargs.get("to", "")
 
-                # Skip if this is an incoming relationship (we're the target, not the source)
-                if target_model_id == unique_id:
+                import re
+
+                def _parse_ref(expr: str) -> str | None:
+                    match = re.search(r"ref\(['\"]([^'\"]+)['\"]\)", expr)
+                    return match.group(1) if match else None
+
+                def _parse_source(expr: str) -> tuple[str, str] | None:
+                    match = re.search(
+                        r"source\(['\"]([^'\"]+)['\"]\s*,\s*['\"]([^'\"]+)['\"]\)",
+                        expr,
+                    )
+                    return (match.group(1), match.group(2)) if match else None
+
+                def _resolve_unique_id(expr: str) -> str | None:
+                    ref_name = _parse_ref(expr)
+                    if ref_name:
+                        for node_id in depends_on_nodes:
+                            if node_id.startswith("model.") and node_id.endswith(
+                                f".{ref_name}"
+                            ):
+                                return node_id
+                    source_pair = _parse_source(expr)
+                    if source_pair:
+                        source_name, table_name = source_pair
+                        for node_id in depends_on_nodes:
+                            if node_id.startswith("source.") and node_id.endswith(
+                                f".{source_name}.{table_name}"
+                            ):
+                                return node_id
+                    return None
+
+                source_model_id = _resolve_unique_id(model_expr)
+                target_model_id = _resolve_unique_id(to_expr)
+
+                # Fallback: if we can't parse, assume the current model is the source
+                if not source_model_id and unique_id in depends_on_nodes:
+                    source_model_id = unique_id
+
+                # If target is unknown but we know the source, take the other dependency
+                if not target_model_id and source_model_id in depends_on_nodes:
+                    other = [n for n in depends_on_nodes if n != source_model_id]
+                    if len(other) == 1:
+                        target_model_id = other[0]
+
+                # Skip if this is an incoming relationship (we're the FK target, not source)
+                if source_model_id != unique_id:
                     _logger.debug(
                         "Skipping incoming relationship test '%s' - we are the FK target, not source",
                         child_name,
                     )
                     continue
 
-                # Process only if we are the source model
-                if source_model_id != unique_id:
+                if not target_model_id:
                     _logger.debug(
-                        "Skipping relationship test '%s' - not defined on current model",
+                        "Cannot resolve FK target for relationship '%s'",
                         child_name,
                     )
                     continue
 
-                # Now target_model_id is the FK target
                 depends_on_id = target_model_id
                 depends_on_group = Group.from_unique_id(depends_on_id)
                 if not depends_on_group:
@@ -273,51 +315,51 @@ class Manifest:
                 fk_target_schema = fk_target_model.get("schema", DEFAULT_SCHEMA)
                 fk_target_table = f"{fk_target_schema}.{fk_target_table}"
 
-                # dbt 2.0: Parse generated_sql_file to extract field parameter
-                test_kwargs = child["test_metadata"]["kwargs"]
-                fk_target_field = None
+                # dbt 2.0: target field is usually present in test_metadata kwargs
+                test_kwargs = child.get("test_metadata", {}).get("kwargs", {})
+                fk_target_field = test_kwargs.get("field")
 
-                if "generated_sql_file" in child:
-                    # dbt 2.0 stores the rendered test call in generated_sql_file
-                    # Example: {{ test_relationships(column_name="product_id", field="product_id", model=..., to=ref('dim_product')) }}
-                    # The path is relative to project root, but manifest is in target/
-                    # So we need to go up one level from manifest location
-                    sql_file_path = child["generated_sql_file"]
-                    manifest_path = Path(self.path)
-                    # manifest is at dbt/target/manifest.json
-                    # sql_file_path is target/generic_tests/...sql
-                    # We need dbt/target/generic_tests/...sql
-                    project_root = manifest_path.parent.parent  # Go from target/ to dbt/
-                    sql_full_path = project_root / sql_file_path
+                if not fk_target_field:
+                    # Fallback: parse generated_sql_file to extract field parameter
+                    sql_file_path = child.get("generated_sql_file")
+                    if sql_file_path:
+                        # Example: {{ test_relationships(column_name="product_id", field="product_id", model=..., to=ref('dim_product')) }}
+                        # The path is relative to project root, but manifest is in target/
+                        # So we need to go up one level from manifest location
+                        manifest_path = Path(self.path)
+                        project_root = manifest_path.parent.parent  # Go from target/ to dbt/
+                        sql_full_path = project_root / sql_file_path
 
-                    try:
-                        with open(sql_full_path, "r", encoding="utf-8") as f:
-                            sql_content = f.read()
+                        try:
+                            with open(sql_full_path, "r", encoding="utf-8") as f:
+                                sql_content = f.read()
 
-                        # Extract field= parameter from the test call
-                        import re
-                        field_match = re.search(r'field=["\']?(\w+)["\']?', sql_content)
-                        if field_match:
-                            fk_target_field = field_match.group(1)
-                        else:
+                            # Extract field= parameter from the test call
+                            import re
+                            field_match = re.search(
+                                r'field=["\']?(\w+)["\']?', sql_content
+                            )
+                            if field_match:
+                                fk_target_field = field_match.group(1)
+                            else:
+                                _logger.warning(
+                                    "Cannot extract target field from generated SQL for relationship '%s'",
+                                    child_name,
+                                )
+                                continue
+                        except Exception as e:
                             _logger.warning(
-                                "Cannot extract target field from generated SQL for relationship '%s'",
+                                "Failed to read generated SQL file for relationship '%s': %s",
                                 child_name,
+                                e,
                             )
                             continue
-                    except Exception as e:
+                    else:
                         _logger.warning(
-                            "Failed to read generated SQL file for relationship '%s': %s",
+                            "Missing relationship target field for '%s'",
                             child_name,
-                            e,
                         )
                         continue
-                else:
-                    _logger.warning(
-                        "Missing generated_sql_file for relationship '%s'",
-                        child_name,
-                    )
-                    continue
 
                 # Get source column name from kwargs (both dbt 1.x and 2.0)
                 source_column = test_kwargs.get("column_name")
