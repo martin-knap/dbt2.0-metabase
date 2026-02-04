@@ -339,9 +339,7 @@ class ExposuresMixin(metaclass=ABCMeta):
             # Only include SQL for query exposures
             exposure.native_query = native_query
 
-    def __exposure_mbql5_query(
-        self, ctx: _Context, exposure: _Exposure, card: Mapping
-    ):
+    def __exposure_mbql5_query(self, ctx: _Context, exposure: _Exposure, card: Mapping):
         """Extracts exposures from Metabase MBQL 5 queries (Metabase 0.57+)."""
 
         dataset_query = card.get("dataset_query", {})

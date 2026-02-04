@@ -236,6 +236,7 @@ class Manifest:
                 test_kwargs = child.get("test_metadata", {}).get("kwargs", {})
                 model_expr = test_kwargs.get("model", "")
                 to_expr = test_kwargs.get("to", "")
+                nodes = tuple(depends_on_nodes)
 
                 import re
 
@@ -250,10 +251,12 @@ class Manifest:
                     )
                     return (match.group(1), match.group(2)) if match else None
 
-                def _resolve_unique_id(expr: str) -> str | None:
+                def _resolve_unique_id(
+                    expr: str, nodes: tuple[str, ...] = nodes
+                ) -> str | None:
                     ref_name = _parse_ref(expr)
                     if ref_name:
-                        for node_id in depends_on_nodes:
+                        for node_id in nodes:
                             if node_id.startswith("model.") and node_id.endswith(
                                 f".{ref_name}"
                             ):
@@ -261,7 +264,7 @@ class Manifest:
                     source_pair = _parse_source(expr)
                     if source_pair:
                         source_name, table_name = source_pair
-                        for node_id in depends_on_nodes:
+                        for node_id in nodes:
                             if node_id.startswith("source.") and node_id.endswith(
                                 f".{source_name}.{table_name}"
                             ):
@@ -327,7 +330,9 @@ class Manifest:
                         # The path is relative to project root, but manifest is in target/
                         # So we need to go up one level from manifest location
                         manifest_path = Path(self.path)
-                        project_root = manifest_path.parent.parent  # Go from target/ to dbt/
+                        project_root = (
+                            manifest_path.parent.parent
+                        )  # Go from target/ to dbt/
                         sql_full_path = project_root / sql_file_path
 
                         try:
@@ -336,6 +341,7 @@ class Manifest:
 
                             # Extract field= parameter from the test call
                             import re
+
                             field_match = re.search(
                                 r'field=["\']?(\w+)["\']?', sql_content
                             )
