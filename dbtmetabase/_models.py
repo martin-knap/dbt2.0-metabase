@@ -15,6 +15,7 @@ from .metabase import Metabase
 _logger = logging.getLogger(__name__)
 
 _SYNC_PERIOD = 5
+_SYNC_RETRIGGER_INTERVAL = 30
 
 
 class ModelsMixin(metaclass=ABCMeta):
@@ -73,60 +74,68 @@ class ModelsMixin(metaclass=ABCMeta):
             skip_sources=skip_sources,
         )
 
-        self.metabase.sync_database_schema(database["id"])
+        # Pre-sync check: determine which fields are expected vs. present
+        tables = self._get_metabase_tables(database["id"])
+        missing = self._find_missing_fields(models, tables)
 
-        deadline = int(time.time()) + sync_timeout
-        synced = False
-        while not synced:
-            time.sleep(_SYNC_PERIOD)
-
-            tables = self._get_metabase_tables(database["id"])
-
-            synced = True
-            for model in models:
-                schema_name = model.schema.upper()
-                model_name = model.alias.upper()
-                schema_table_key = f"{schema_name}.{model_name}"
-                table = tables.get(schema_table_key)
-                table_key = schema_table_key
-
-                # Fallback for multi-database connections: try database.schema.table format
-                if not table and model.database:
-                    database_schema_table_key = model.alias_path.upper()
-                    table = tables.get(database_schema_table_key)
-                    table_key = database_schema_table_key
-
-                if not table:
-                    _logger.warning(
-                        "Table '%s' not in schema '%s'", table_key, schema_name
-                    )
-                    synced = False
-                    continue
-
-                for column in model.columns:
-                    column_name = column.name.upper()
-
-                    field = table.get("fields", {}).get(column_name)
-                    if not field:
-                        if table.get("visibility_type") is not None:
-                            table_label = "hidden table"
-                            table["stale"] = True
-                        else:
-                            table_label = "table"
-                            synced = False
-
-                        _logger.warning(
-                            "Field '%s' not in %s '%s'",
-                            column_name,
-                            table_label,
-                            table_key,
-                        )
-                        continue
-
+        if not missing:
+            _logger.info(
+                "All expected fields already present in Metabase, skipping schema sync"
+            )
             ctx.tables = tables
+        else:
+            _logger.info(
+                "Found %d missing field(s) in Metabase, triggering schema sync",
+                len(missing),
+            )
+            for item in sorted(missing):
+                _logger.info("  Missing: %s", item)
 
-            if int(time.time()) > deadline:
-                break
+            if sync_timeout == 0:
+                # Fire-and-forget: trigger sync but don't wait
+                self._sync_tables_or_database(database["id"], models, tables)
+                _logger.warning(
+                    "sync_timeout=0: triggered schema sync but not waiting "
+                    "for %d missing field(s) to appear — export may fail",
+                    len(missing),
+                )
+                ctx.tables = tables
+            else:
+                # Trigger sync and poll until missing fields appear or timeout
+                self._sync_tables_or_database(database["id"], models, tables)
+                _logger.info(
+                    "Waiting up to %ds for Metabase schema sync to complete...",
+                    sync_timeout,
+                )
+                ctx.tables = self._wait_for_sync(
+                    database_id=database["id"],
+                    models=models,
+                    sync_timeout=sync_timeout,
+                )
+
+        # Verify final state and flag stale hidden tables
+        synced = True
+        for model in models:
+            schema_name = model.schema.upper()
+            model_name = model.alias.upper()
+            schema_table_key = f"{schema_name}.{model_name}"
+            table = ctx.tables.get(schema_table_key)
+
+            if not table and model.database:
+                table = ctx.tables.get(model.alias_path.upper())
+
+            if not table:
+                synced = False
+                continue
+
+            for column in model.columns:
+                column_name = column.name.upper()
+                field = table.get("fields", {}).get(column_name)
+                if not field:
+                    if table.get("visibility_type") is not None:
+                        table["stale"] = True
+                    else:
+                        synced = False
 
         if not synced and sync_timeout:
             raise MetabaseStateError("Unable to sync models with Metabase")
@@ -467,6 +476,135 @@ class ModelsMixin(metaclass=ABCMeta):
             _logger.info("Field '%s' is up to date", column_label)
 
         return success
+
+    def _sync_tables_or_database(
+        self,
+        database_id: str,
+        models: Iterable[Model],
+        tables: Mapping[str, MutableMapping],
+    ):
+        """Syncs only the specific tables that match the models being exported.
+
+        Falls back to database-level sync if table IDs cannot be resolved.
+        This avoids expensive full-database syncs when only a few models are targeted.
+        """
+        table_ids: list[str] = []
+        for model in models:
+            schema_name = model.schema.upper()
+            model_name = model.alias.upper()
+            schema_table_key = f"{schema_name}.{model_name}"
+            table = tables.get(schema_table_key)
+
+            if not table and model.database:
+                table = tables.get(model.alias_path.upper())
+
+            if table and "id" in table:
+                table_ids.append(table["id"])
+
+        if table_ids:
+            _logger.info(
+                "Syncing %d table(s) individually instead of full database sync",
+                len(table_ids),
+            )
+            for table_id in table_ids:
+                self.metabase.sync_table_schema(table_id)
+        else:
+            _logger.info(
+                "Could not resolve table IDs, falling back to database-level sync"
+            )
+            self.metabase.sync_database_schema(database_id)
+
+    def _find_missing_fields(
+        self,
+        models: Iterable[Model],
+        tables: Mapping[str, MutableMapping],
+    ) -> list[str]:
+        """Compares expected dbt columns against Metabase metadata and returns missing field labels.
+
+        Returns:
+            List of 'TABLE_KEY.COLUMN_NAME' strings for fields missing from Metabase.
+        """
+        missing: list[str] = []
+
+        for model in models:
+            schema_name = model.schema.upper()
+            model_name = model.alias.upper()
+            schema_table_key = f"{schema_name}.{model_name}"
+            table = tables.get(schema_table_key)
+            table_key = schema_table_key
+
+            # Fallback for multi-database connections
+            if not table and model.database:
+                database_schema_table_key = model.alias_path.upper()
+                table = tables.get(database_schema_table_key)
+                table_key = database_schema_table_key
+
+            if not table:
+                # Entire table missing — report each column as missing
+                for column in model.columns:
+                    missing.append(f"{schema_table_key}.{column.name.upper()}")
+                continue
+
+            # Skip hidden tables — their fields may be stale but that's expected
+            if table.get("visibility_type") is not None:
+                continue
+
+            for column in model.columns:
+                column_name = column.name.upper()
+                if not table.get("fields", {}).get(column_name):
+                    missing.append(f"{table_key}.{column_name}")
+
+        return missing
+
+    def _wait_for_sync(
+        self,
+        database_id: str,
+        models: Iterable[Model],
+        sync_timeout: int,
+    ) -> Mapping[str, MutableMapping]:
+        """Polls Metabase metadata until all expected fields appear or timeout.
+
+        Re-triggers schema sync periodically if fields remain missing.
+
+        Returns:
+            Final tables mapping from Metabase metadata.
+        """
+        deadline = int(time.time()) + sync_timeout
+        last_trigger = time.time()
+        tables: Mapping[str, MutableMapping] = {}
+
+        while True:
+            time.sleep(_SYNC_PERIOD)
+
+            tables = self._get_metabase_tables(database_id)
+            missing = self._find_missing_fields(models, tables)
+
+            if not missing:
+                _logger.info("Schema sync complete — all expected fields are present")
+                return tables
+
+            elapsed = int(time.time() - (deadline - sync_timeout))
+            _logger.info(
+                "Still waiting for %d missing field(s) (%ds elapsed)...",
+                len(missing),
+                elapsed,
+            )
+
+            # Re-trigger sync periodically in case Metabase stalled
+            if time.time() - last_trigger >= _SYNC_RETRIGGER_INTERVAL:
+                _logger.info("Re-triggering schema sync")
+                self._sync_tables_or_database(database_id, models, tables)
+                last_trigger = time.time()
+
+            if int(time.time()) > deadline:
+                _logger.warning(
+                    "Schema sync timed out after %ds with %d field(s) still missing:",
+                    sync_timeout,
+                    len(missing),
+                )
+                for item in sorted(missing):
+                    _logger.warning("  Still missing: %s", item)
+                return tables
 
     def _get_metabase_tables(self, database_id: str) -> Mapping[str, MutableMapping]:
         tables = {}
