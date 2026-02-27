@@ -74,6 +74,12 @@ class Metabase:
                 if isinstance(value, bool):
                     params[key] = str(value).lower()
 
+        if "rescan_values" in path:
+            _logger.warning(
+                "Field values rescan not available — not needed for dbt-metabase sync"
+            )
+            return {}
+
         response = self.session.request(
             method=method,
             url=f"{self.url}{path}",
@@ -109,6 +115,25 @@ class Metabase:
     def sync_database_schema(self, uid: str):
         """Triggers schema sync on a database."""
         self._api("post", f"/api/database/{uid}/sync_schema")
+
+    def sync_table_schema(self, uid: str):
+        """Triggers schema sync on a single table (much cheaper than database-level sync)."""
+        self._api("post", f"/api/table/{uid}/sync_schema")
+
+    def get_database_fields(self, uid: str) -> set[str]:
+        """Returns a set of 'SCHEMA.TABLE.FIELD' strings for all fields in a database.
+
+        Useful for checking whether specific fields have appeared after a schema sync.
+        """
+        metadata = self.get_database_metadata(uid)
+        fields: set[str] = set()
+        for table in metadata.get("tables", []):
+            schema_name = (table.get("schema") or "PUBLIC").upper()
+            table_name = table["name"].upper()
+            for field in table.get("fields", []):
+                field_name = field["name"].upper()
+                fields.add(f"{schema_name}.{table_name}.{field_name}")
+        return fields
 
     def get_database_metadata(self, uid: str) -> Mapping:
         """Retrieves metadata for all tables and fields in a database, including hidden ones."""
