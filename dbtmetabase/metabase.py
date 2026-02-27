@@ -69,6 +69,12 @@ class Metabase:
     ) -> Union[Mapping, Sequence]:
         """Raw API call."""
 
+        if "rescan_values" in path:
+            _logger.warning(
+                "Field values rescan blocked — not needed for dbt-metabase sync"
+            )
+            return {}
+
         if params:
             for key, value in params.items():
                 if isinstance(value, bool):
@@ -109,6 +115,10 @@ class Metabase:
     def sync_database_schema(self, uid: str):
         """Triggers schema sync on a database."""
         self._api("post", f"/api/database/{uid}/sync_schema")
+
+    def sync_table_schema(self, uid: str):
+        """Triggers schema sync on a single table (much cheaper than database-level sync)."""
+        self._api("post", f"/api/table/{uid}/sync_schema")
 
     def get_database_metadata(self, uid: str) -> Mapping:
         """Retrieves metadata for all tables and fields in a database, including hidden ones."""

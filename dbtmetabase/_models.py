@@ -73,7 +73,7 @@ class ModelsMixin(metaclass=ABCMeta):
             skip_sources=skip_sources,
         )
 
-        self.metabase.sync_database_schema(database["id"])
+        self._sync_tables_or_database(database["id"], models)
 
         deadline = int(time.time()) + sync_timeout
         synced = False
@@ -467,6 +467,41 @@ class ModelsMixin(metaclass=ABCMeta):
             _logger.info("Field '%s' is up to date", column_label)
 
         return success
+
+    def _sync_tables_or_database(
+        self,
+        database_id: str,
+        models: Iterable[Model],
+    ):
+        """Syncs individual table schemas when possible, falls back to database-level sync.
+
+        Resolves Metabase table IDs for the given models and triggers table-level
+        sync for each. If no tables can be resolved (e.g. first deployment),
+        falls back to a full database schema sync.
+        """
+
+        metadata = self.metabase.get_database_metadata(database_id)
+        api_tables = {
+            f"{(t.get('schema') or '').upper()}.{t['name'].upper()}": t
+            for t in metadata.get("tables", [])
+        }
+
+        synced_any = False
+        for model in models:
+            key = f"{model.schema.upper()}.{model.alias.upper()}"
+            api_table = api_tables.get(key)
+            if api_table:
+                self.metabase.sync_table_schema(api_table["id"])
+                _logger.info("Triggered table-level sync for '%s'", key)
+                synced_any = True
+            else:
+                _logger.debug("Table '%s' not found for table-level sync", key)
+
+        if not synced_any:
+            _logger.info(
+                "No tables resolved for table-level sync, falling back to database sync"
+            )
+            self.metabase.sync_database_schema(database_id)
 
     def _get_metabase_tables(self, database_id: str) -> Mapping[str, MutableMapping]:
         tables = {}
